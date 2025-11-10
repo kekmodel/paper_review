@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Repository Overview
 
 This is a research analysis repository documenting and comparing three major Chinese LLM paper releases from 2024-2025:
