@@ -152,13 +152,17 @@ def create_world_model_prompt(state, action, task, domain_context):
     {domain_context}
 
     [Current Situation]
-    Task: {task}
+    Task: {task.description}
+    Available Tools: {format_tools(task.available_tools)}
     State: {state}
     Action: {action}
 
     [Instructions]
     1. 위 행동의 결과로 나타날 다음 상태를 예측하시오.
     2. 이 행동이 태스크 목표에 부합하는 올바른 행동인지 판단하시오. (0 또는 1)
+       - 사용 가능한 도구 외의 도구를 사용했다면 0
+       - 도구를 올바르게 사용했지만 목표와 무관하면 0
+       - 목표 달성에 기여하는 올바른 도구 사용이면 1
 
     [Output Format]
     Next State: ...
@@ -175,33 +179,223 @@ def create_world_model_prompt(state, action, task, domain_context):
 
 #### 3.3.1 호기심 기반 태스크 제안 (Curiosity-based Proposal)
 
-**역할**: 다양한 태스크 후보 생성
+**역할**: 다양한 태스크 후보 생성 (Task + Tool Set)
+
+**핵심**: Agent 학습에서는 Task와 함께 사용 가능한 Tool Set도 정의되어야 함
+```
+Task 정의 = {
+    description: "무엇을 해야 하는가",
+    available_tools: ["어떤 도구를 쓸 수 있는가"],
+    initial_state: "시작 상태"
+}
+
+→ Agent: Tool Set 기반으로 action 선택
+→ World Model: Tool Set 기반으로 next state 시뮬레이션
+```
 
 ```python
-def generate_task_candidates(domain_context, num_candidates=100):
+@dataclass
+class Task:
+    description: str           # 태스크 설명
+    available_tools: list[Tool]  # 사용 가능한 도구들
+    initial_state: str         # 초기 상태
+    max_steps: int = 20        # 최대 스텝 수
+
+@dataclass
+class Tool:
+    name: str                  # 도구 이름 (e.g., "Read", "Edit", "Bash")
+    description: str           # 도구 설명
+    parameters: dict           # 파라미터 스키마
+
+def generate_task_candidates(domain_context, tool_library, num_candidates=100):
     """
     도메인 context 기반으로 다양한 태스크 후보 생성
+    각 태스크는 사용 가능한 tool set과 함께 정의됨
     """
     prompt = f"""
     [Domain]
     {domain_context}
 
+    [Available Tool Library]
+    {format_tools(tool_library)}
+
     [Instructions]
     이 도메인에서 agent가 학습하면 좋을 다양한 태스크를 생성하시오.
+    각 태스크에 대해 필요한 도구들을 tool library에서 선택하시오.
 
     다양성 기준:
     - 난이도: 쉬움, 중간, 어려움 균형
     - 상황: 일반적 케이스 + 엣지 케이스
     - 목표 유형: 탐색, 조작, 복합 목표 등
+    - 도구 조합: 단일 도구 ~ 다중 도구 조합
 
-    기존에 생성된 태스크와 겹치지 않는 새로운 상황을 탐색하시오.
+    [Output Format]
+    Task 1:
+      description: ...
+      tools: [tool1, tool2, ...]
+      initial_state: ...
+
+    Task 2:
+      ...
     """
     return task_generator.generate(prompt, n=num_candidates)
 ```
 
-#### 3.3.2 Reward Entropy 기반 필터링
+**Tool Set 설계 전략**:
+```
+1. 태스크 난이도와 도구 수 연동
+   ├── Easy: 1-2개 도구 (e.g., Read만)
+   ├── Medium: 3-5개 도구 (e.g., Read, Edit, Grep)
+   └── Hard: 5개+ 도구 (e.g., 전체 도구 세트)
 
-**역할**: 학습 효과가 높은 태스크 선택
+2. 도구 조합 다양성
+   ├── 읽기 전용: [Read, Grep, Glob]
+   ├── 수정 포함: [Read, Edit, Write]
+   ├── 실행 포함: [Bash, Read, Write]
+   └── 전체: [Read, Edit, Write, Bash, Grep, Glob, ...]
+
+3. 도메인별 특화 도구
+   ├── 코딩: [Read, Edit, Bash, Grep]
+   ├── 데이터 분석: [Read, Write, Python]
+   └── 시스템 관리: [Bash, Read, Write]
+```
+
+#### 3.3.2 Task Pool 관리
+
+**문제**: Task + Tool Set을 한 번 쓰고 버리면 낭비
+```
+Bad: Task 생성 → 1회 사용 → 폐기 → 다시 생성 (비효율)
+Good: Task Pool 유지 → 반복 탐험 → 통계 축적 → Curriculum 형성
+```
+
+**Task Pool 구조**:
+```python
+@dataclass
+class TaskEntry:
+    task: Task                    # Task + Tool Set
+    created_at: int               # 생성 iteration
+    attempts: int = 0             # 시도 횟수
+    successes: int = 0            # 성공 횟수
+    recent_rewards: list = None   # 최근 K번 reward (entropy 계산용)
+    entropy: float = 1.0          # 현재 entropy 추정치
+    status: str = "active"        # active / mastered / too_hard
+
+class TaskPool:
+    def __init__(self, max_size=500):
+        self.pool: dict[str, TaskEntry] = {}
+        self.max_size = max_size
+
+    def add_tasks(self, tasks: list[Task]):
+        """새 태스크 추가"""
+        for task in tasks:
+            task_id = hash_task(task)
+            if task_id not in self.pool:
+                self.pool[task_id] = TaskEntry(task=task, created_at=self.iteration)
+
+    def update_stats(self, task_id: str, reward: float):
+        """태스크 통계 업데이트"""
+        entry = self.pool[task_id]
+        entry.attempts += 1
+        entry.successes += int(reward > 0)
+        entry.recent_rewards.append(reward)
+        entry.recent_rewards = entry.recent_rewards[-10:]  # 최근 10개만 유지
+
+        # Entropy 재계산
+        entry.entropy = compute_entropy(entry.recent_rewards)
+
+        # 상태 업데이트
+        if entry.entropy < 0.1 and entry.successes / entry.attempts > 0.9:
+            entry.status = "mastered"
+        elif entry.entropy < 0.1 and entry.successes / entry.attempts < 0.1:
+            entry.status = "too_hard"
+
+    def sample_tasks(self, n: int, strategy: str = "entropy") -> list[Task]:
+        """학습할 태스크 샘플링"""
+        active_tasks = [e for e in self.pool.values() if e.status == "active"]
+
+        if strategy == "entropy":
+            # Entropy 높은 순 (학습 효과 최대화)
+            active_tasks.sort(key=lambda e: e.entropy, reverse=True)
+        elif strategy == "balanced":
+            # Entropy 기반 확률적 샘플링
+            probs = softmax([e.entropy for e in active_tasks])
+            return np.random.choice(active_tasks, n, p=probs, replace=False)
+
+        return [e.task for e in active_tasks[:n]]
+
+    def get_curriculum_stats(self):
+        """현재 curriculum 상태"""
+        return {
+            "total": len(self.pool),
+            "active": sum(1 for e in self.pool.values() if e.status == "active"),
+            "mastered": sum(1 for e in self.pool.values() if e.status == "mastered"),
+            "too_hard": sum(1 for e in self.pool.values() if e.status == "too_hard"),
+            "avg_entropy": np.mean([e.entropy for e in self.pool.values()])
+        }
+```
+
+**Task Pool 생명주기**:
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Task Pool Lifecycle                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   [Task Generator] ──► [Task Pool] ◄── 새 태스크 주기적 추가                │
+│                             │                                               │
+│                             ▼                                               │
+│                    ┌────────────────┐                                       │
+│                    │  Active Tasks  │ ◄─── Entropy 높음, 학습 중            │
+│                    └───────┬────────┘                                       │
+│                            │                                                │
+│              ┌─────────────┼─────────────┐                                  │
+│              ▼             ▼             ▼                                  │
+│     ┌──────────────┐ ┌──────────┐ ┌────────────┐                           │
+│     │   Mastered   │ │  Active  │ │  Too Hard  │                           │
+│     │ (entropy↓    │ │ (계속    │ │ (entropy↓  │                           │
+│     │  success↑)   │ │  학습)   │ │  success↓) │                           │
+│     └──────────────┘ └──────────┘ └─────┬──────┘                           │
+│            │                            │                                   │
+│            │         Actor 성장 후      │                                   │
+│            │         ◄─────────────────┘                                   │
+│            │         재활성화 가능                                          │
+│            ▼                                                                │
+│     [Mastered Pool] ── 가끔 재테스트 (forgetting 체크)                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**주기적 Task Pool 관리**:
+```python
+def manage_task_pool(pool: TaskPool, task_generator, iteration: int):
+    """매 N iteration마다 실행"""
+
+    # 1. 새 태스크 추가 (탐험)
+    if pool.get_curriculum_stats()["active"] < 100:
+        new_tasks = task_generator.generate_candidates(n=20)
+        pool.add_tasks(new_tasks)
+
+    # 2. Too Hard → Active 재활성화 (Actor 성장 반영)
+    if iteration % 50 == 0:
+        for entry in pool.pool.values():
+            if entry.status == "too_hard":
+                entry.status = "active"
+                entry.recent_rewards = []  # 리셋
+
+    # 3. Mastered 태스크 재검증 (Catastrophic Forgetting 체크)
+    if iteration % 100 == 0:
+        mastered = [e for e in pool.pool.values() if e.status == "mastered"]
+        sample = random.sample(mastered, min(5, len(mastered)))
+        for entry in sample:
+            # 재테스트 후 성공률 떨어지면 재활성화
+            pass
+
+    # 4. 오래된 미사용 태스크 정리
+    pool.cleanup_old_tasks(max_age=500)
+```
+
+#### 3.3.3 Reward Entropy 기반 필터링
+
+**역할**: Task Pool에서 학습 효과가 높은 태스크 선택
 
 **핵심 아이디어**:
 ```
@@ -427,123 +621,94 @@ Online이 필요한 이유:
 │      │              │                                                       │
 │      └── 1회 ───────┘                                                       │
 │                                                                             │
-│  Online:                                                                    │
+│  Online (On-policy):                                                        │
 │  ─────────────────────────────────────────────────────────                  │
 │  [Data Gen] ──► [Train] ──► [Data Gen] ──► [Train] ──► ... ──► [Done]      │
 │       │            │             │             │                            │
 │       └── Actor ───┘             └── Actor ────┘                            │
 │           v1                         v2                                     │
 │                                                                             │
+│  * 각 iteration에서 현재 정책으로 생성한 데이터만 사용 (no replay buffer)    │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Online GRPO 알고리즘**:
+**Online GRPO 알고리즘 (Pure On-policy)**:
 ```python
-def online_grpo_training(actor, world_model, task_generator,
+def online_grpo_training(actor, world_model, task_generator, task_pool,
                          num_iterations, rollouts_per_iter):
     """
-    Online GRPO 학습
+    Online GRPO 학습 (Pure On-policy)
+
+    GRPO는 on-policy 알고리즘이므로 replay buffer를 사용하지 않음.
+    매 iteration마다 현재 정책으로 새 데이터를 생성하고 바로 학습.
+    Task Pool을 통해 curriculum 유지.
     """
-    replay_buffer = ReplayBuffer(max_size=10000)
-
     for iteration in range(num_iterations):
-        # ===== Phase 1: Task Selection =====
-        task_candidates = task_generator.generate_candidates(n=50)
-        selected_tasks = select_tasks_by_entropy(
-            task_candidates, actor, world_model,
-            k_rollouts=3, top_n=10
-        )
+        # ===== Phase 0: Task Pool 관리 =====
+        manage_task_pool(task_pool, task_generator, iteration)
 
-        # ===== Phase 2: Online Data Generation =====
+        # ===== Phase 1: Task Selection =====
+        # Task Pool에서 entropy 기반 샘플링
+        selected_tasks = task_pool.sample_tasks(n=10, strategy="entropy")
+
+        # ===== Phase 2: On-policy Data Generation =====
         # 현재 Actor로 새 데이터 생성
-        new_trajectories = []
+        trajectories = []
         for task in selected_tasks:
+            task_id = hash_task(task)
             for _ in range(rollouts_per_iter // len(selected_tasks)):
                 traj = rollout(actor, world_model, task)
                 rewards = compute_rewards(traj, task)
-                new_trajectories.append({
+                trajectories.append({
                     'task': task,
+                    'task_id': task_id,
                     'trajectory': traj,
                     **rewards
                 })
 
-        # Replay buffer에 추가
-        replay_buffer.add(new_trajectories)
+                # Task Pool 통계 업데이트
+                task_pool.update_stats(task_id, rewards['trajectory_reward'])
 
         # ===== Phase 3: Policy Update =====
-        # 새 데이터 + 버퍼에서 샘플링 (혼합 비율 조절 가능)
-        batch = sample_batch(
-            new_data=new_trajectories,
-            buffer=replay_buffer,
-            new_ratio=0.7,  # 새 데이터 70%
-            buffer_ratio=0.3  # 버퍼 30%
-        )
-
-        # GRPO 업데이트
-        actor = grpo_update(actor, batch)
+        # 현재 iteration에서 생성한 데이터만으로 업데이트 (on-policy)
+        actor = grpo_update(actor, trajectories)
 
         # ===== Logging =====
-        log_metrics(iteration, new_trajectories)
+        log_metrics(iteration, trajectories)
+        log_curriculum_stats(task_pool.get_curriculum_stats())
 
     return actor
 ```
 
-**핵심 구성 요소**:
+**GRPO가 On-policy인 이유**:
+```
+GRPO (Group Relative Policy Optimization):
+├── 같은 task에 대해 여러 trajectory를 현재 정책으로 생성
+├── 그룹 내 상대적 비교로 advantage 계산
+├── 현재 정책의 행동 분포에서 직접 학습
+└── Importance sampling 없이 gradient 계산
 
-#### 3.6.1 Replay Buffer
-
-```python
-class ReplayBuffer:
-    """
-    Online 학습을 위한 경험 버퍼
-    """
-    def __init__(self, max_size=10000):
-        self.buffer = deque(maxlen=max_size)
-
-    def add(self, trajectories):
-        for traj in trajectories:
-            self.buffer.append(traj)
-
-    def sample(self, n):
-        return random.sample(self.buffer, min(n, len(self.buffer)))
-
-    def sample_by_task(self, task, n):
-        """같은 task의 trajectory만 샘플링 (GRPO 비교용)"""
-        same_task = [t for t in self.buffer if t['task'] == task]
-        return random.sample(same_task, min(n, len(same_task)))
+Off-policy (replay buffer) 사용 시 문제:
+├── 과거 정책의 데이터 → 현재 정책과 분포 불일치
+├── Importance weight 필요 → GRPO 장점 상실
+└── 이론적 보장 깨짐
 ```
 
-#### 3.6.2 혼합 샘플링 전략
-
+**On-policy의 Trade-off**:
 ```
-새 데이터 vs 버퍼 데이터 비율:
+장점:
+├── 이론적으로 올바름 (분포 일치)
+├── 구현 단순 (importance weight 불필요)
+└── 안정적 학습
 
-Early training:   new 90% / buffer 10%
-  → 빠른 탐색, 다양성 확보
-
-Mid training:     new 70% / buffer 30%
-  → 균형 잡힌 학습
-
-Late training:    new 50% / buffer 50%
-  → 안정적 수렴, 과거 좋은 경험 활용
+단점:
+├── Sample efficiency 낮음 (데이터 1회만 사용)
+├── 매 iteration API 호출 필요
+└── 비용 증가
 ```
 
-```python
-def sample_batch(new_data, buffer, new_ratio, buffer_ratio, batch_size=64):
-    """
-    새 데이터와 버퍼를 혼합하여 배치 구성
-    """
-    n_new = int(batch_size * new_ratio)
-    n_buffer = int(batch_size * buffer_ratio)
-
-    batch = []
-    batch += random.sample(new_data, min(n_new, len(new_data)))
-    batch += buffer.sample(n_buffer)
-
-    return batch
-```
-
-#### 3.6.3 Async Rollout (고급)
+#### 3.6.1 Async Rollout (고급)
 
 ```
 동기 방식 (Simple):
@@ -555,46 +720,45 @@ def sample_batch(new_data, buffer, new_ratio, buffer_ratio, batch_size=64):
 
 비동기 방식 (Advanced):
 ┌─────────────────────────────────────────────────┐
-│  Rollout Worker 1 ──────────┐                   │
-│  Rollout Worker 2 ──────────┼──► Buffer ──► Train
-│  Rollout Worker 3 ──────────┘       ↑          │
-│                                     │          │
-│                              continuously      │
+│  Rollout Workers ──► Queue ──► Train            │
+│       │                          │              │
+│       └──── 동기화 (주기적) ──────┘              │
 │                                                 │
-│  장점: GPU 활용도 최대화                         │
+│  * Actor 버전 동기화로 on-policy 유지           │
+│  * 장점: GPU 활용도 최대화                       │
 └─────────────────────────────────────────────────┘
 ```
 
 ```python
-# 비동기 Online 학습 (개념)
+# 비동기 Online 학습 (On-policy 유지)
 class AsyncOnlineTrainer:
     def __init__(self, actor, world_model, num_workers=4):
         self.actor = actor
         self.world_model = world_model
-        self.buffer = SharedReplayBuffer()
         self.num_workers = num_workers
+        self.trajectory_queue = Queue()
 
     async def rollout_worker(self, worker_id):
-        """비동기 rollout 워커"""
+        """비동기 rollout 워커 (동기화된 actor 사용)"""
         while not self.done:
+            # 현재 actor 스냅샷 가져오기 (on-policy 보장)
+            current_actor = self.get_synced_actor()
             task = self.task_generator.sample()
-            traj = await self.async_rollout(task)
-            self.buffer.add(traj)
+            traj = await self.async_rollout(current_actor, task)
+            self.trajectory_queue.put(traj)
 
-    async def train_loop(self):
-        """학습 루프 (버퍼에서 지속적으로 샘플링)"""
-        while not self.done:
-            if len(self.buffer) >= min_buffer_size:
-                batch = self.buffer.sample(batch_size)
-                self.actor = grpo_update(self.actor, batch)
+    def train_iteration(self):
+        """학습 iteration (큐에서 배치 수집 후 학습)"""
+        # 충분한 trajectory 수집 대기
+        batch = []
+        while len(batch) < batch_size:
+            batch.append(self.trajectory_queue.get())
 
-    def train(self):
-        """메인 학습 함수"""
-        # 워커들과 학습 루프 동시 실행
-        asyncio.gather(
-            *[self.rollout_worker(i) for i in range(self.num_workers)],
-            self.train_loop()
-        )
+        # On-policy 업데이트
+        self.actor = grpo_update(self.actor, batch)
+
+        # 워커들에게 새 actor 동기화
+        self.sync_actor_to_workers()
 ```
 
 **Online 구현 시 고려사항**:
@@ -603,9 +767,9 @@ class AsyncOnlineTrainer:
    └── World Model API 호출 제한 고려
    └── 배치 요청, 캐싱 등 최적화
 
-2. Actor 버전 관리
-   └── Rollout 중 Actor 업데이트 시 버전 불일치
-   └── 버전 태깅 또는 주기적 동기화
+2. Actor 버전 동기화
+   └── Async 시 워커들이 최신 actor 사용하도록
+   └── 주기적 동기화 또는 iteration 단위 동기화
 
 3. 비용 관리
    └── Online = 지속적 API 호출
@@ -627,7 +791,7 @@ Phase 1 (Offline):
 
 Phase 2 (Online):
 ├── Offline policy로 초기화
-├── Online으로 추가 학습
+├── Online으로 추가 학습 (on-policy)
 └── 더 높은 최종 성능 달성
 
 장점:
@@ -645,7 +809,8 @@ class PostTrainingRL:
     def __init__(self,
                  actor_model_path,
                  world_model_api,
-                 domain_context):
+                 domain_context,
+                 tool_library):
         # Actor: 학습 대상 (오픈소스 Agentic LRM)
         self.actor = load_model(actor_model_path)
 
@@ -655,25 +820,30 @@ class PostTrainingRL:
             domain_context=domain_context
         )
 
-        # Task Generator
-        self.task_generator = TaskGenerator(domain_context)
+        # Task Generator & Pool
+        self.task_generator = TaskGenerator(domain_context, tool_library)
+        self.task_pool = TaskPool(max_size=500)
+
+        # 초기 Task Pool 구성
+        initial_tasks = self.task_generator.generate_candidates(n=100)
+        self.task_pool.add_tasks(initial_tasks)
 
     def train(self, num_iterations, tasks_per_iter, rollouts_per_task):
         for iteration in range(num_iterations):
-            # ===== Phase 1: Task Generation =====
-            # 호기심 기반 태스크 후보 생성
-            task_candidates = self.task_generator.generate_candidates(n=100)
+            # ===== Phase 0: Task Pool 관리 =====
+            manage_task_pool(self.task_pool, self.task_generator, iteration)
 
-            # Reward entropy로 필터링
-            selected_tasks = self.select_tasks_by_entropy(
-                task_candidates,
-                k_rollouts=5,
-                top_n=tasks_per_iter
+            # ===== Phase 1: Task Selection =====
+            # Task Pool에서 entropy 기반 샘플링
+            selected_tasks = self.task_pool.sample_tasks(
+                n=tasks_per_iter,
+                strategy="entropy"
             )
 
             # ===== Phase 2: Data Generation =====
             dataset = []
             for task in selected_tasks:
+                task_id = hash_task(task)
                 for _ in range(rollouts_per_task):
                     # Actor로 rollout
                     trajectory = self.rollout(task)
@@ -683,15 +853,20 @@ class PostTrainingRL:
 
                     dataset.append({
                         'task': task,
+                        'task_id': task_id,
                         'trajectory': trajectory,
                         **rewards
                     })
 
+                    # Task Pool 통계 업데이트
+                    self.task_pool.update_stats(task_id, rewards['trajectory_reward'])
+
             # ===== Phase 3: Policy Training =====
             self.actor = self.grpo_update(dataset)
 
-            # Logging
+            # ===== Logging =====
             self.log_metrics(iteration, dataset)
+            self.log_curriculum_stats(self.task_pool.get_curriculum_stats())
 
     def rollout(self, task):
         """Actor와 World Model로 trajectory 생성"""
@@ -699,11 +874,19 @@ class PostTrainingRL:
         state = task.initial_state
 
         for step in range(task.max_steps):
-            # Actor가 행동 선택
-            action = self.actor.generate_action(state, task)
+            # Actor가 행동 선택 (task의 available_tools 기반)
+            action = self.actor.generate_action(
+                state=state,
+                task_description=task.description,
+                available_tools=task.available_tools  # Tool set 주입
+            )
 
-            # World Model이 다음 상태 예측
-            next_state = self.world_model.predict_next_state(state, action, task)
+            # World Model이 다음 상태 예측 (동일한 tool set 공유)
+            next_state = self.world_model.predict_next_state(
+                state=state,
+                action=action,
+                task=task  # task.available_tools 포함
+            )
 
             trajectory.append({
                 'state': state,
@@ -832,7 +1015,7 @@ Gap 분석:
 |------|------|------|
 | 5.3.1 | Pure Offline vs Pure Online | 기본 비교 |
 | 5.3.2 | Offline → Online (2단계) | 하이브리드 효과 |
-| 5.3.3 | 다양한 혼합 비율 | 최적 new/buffer 비율 탐색 |
+| 5.3.3 | Iteration당 rollout 수 변화 | On-policy 배치 크기 최적화 |
 | 5.3.4 | Task 난이도별 Gap | 쉬운/어려운 task에서 차이 |
 | 5.3.5 | 데이터 규모별 Gap | 데이터 많을수록 차이 감소? |
 
@@ -954,8 +1137,8 @@ Gap 분석:
 │  │                         ▼                                           │   │
 │  │                                                                     │   │
 │  │   Phase 2: Online GRPO (확장)                                       │   │
-│  │   ├── 실시간 rollout + 학습                                         │   │
-│  │   ├── Replay buffer + 혼합 샘플링                                   │   │
+│  │   ├── 실시간 rollout + 학습 (on-policy)                             │   │
+│  │   ├── 매 iteration 현재 정책 데이터만 사용                           │   │
 │  │   ├── (선택) Async rollout workers                                  │   │
 │  │   └── 더 높은 최종 성능 기대                                         │   │
 │  │                                                                     │   │
