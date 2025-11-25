@@ -541,6 +541,293 @@ def compute_rewards(trajectory, world_model, task):
 
 ---
 
+### 3.4.5 데이터 포맷: Actor vs World Model
+
+**핵심 구분**: Actor와 World Model은 서로 다른 관점에서 데이터를 봄
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Data Format by Role                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Actor (학습 대상)              World Model (심판)                         │
+│   ─────────────────              ─────────────────                          │
+│   관점: 1인칭 (대화 참여자)      관점: 3인칭 (Meta 관찰자)                  │
+│   포맷: OpenAI Messages          포맷: Flattened Text                       │
+│   목적: Action 생성 → 학습       목적: 판단 → Reward                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Actor 포맷: OpenAI Messages (학습 데이터용)
+
+```python
+# Actor가 보는 포맷 = 학습 데이터로 직접 사용
+training_example = {
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a coding agent. Use tools to complete tasks."
+        },
+        {
+            "role": "user",
+            "content": "Fix the authentication bug in auth.py"
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "arguments": '{"file_path": "auth.py"}'
+                }
+            }]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "def login(user, pwd):\n    return user == 'admin'  # BUG: no password check"
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "arguments": '{"file_path": "auth.py", "old_string": "return user == \'admin\'", "new_string": "return user == \'admin\' and pwd == secret"}'
+                }
+            }]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "content": "File edited successfully"
+        },
+        {
+            "role": "assistant",
+            "content": "Fixed the authentication bug by adding password verification."
+        }
+    ],
+    "tools": [
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read file contents",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "description": "Edit file with string replacement",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"}
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }
+            }
+        }
+    ],
+    # GRPO 메타데이터
+    "task_id": "auth_bug_fix_001",
+    "trajectory_reward": 1.0,
+    "step_rewards": [1, 1, 1]
+}
+
+# 학습 시: tokenizer가 모델별 chat template 자동 적용
+input_ids = tokenizer.apply_chat_template(
+    training_example["messages"],
+    tools=training_example["tools"],
+    return_tensors="pt"
+)
+```
+
+**OpenAI Messages 포맷 장점**:
+```
+1. 학습 직접 사용
+   └── TRL, OpenRLHF, axolotl 등 모든 프레임워크 지원
+   └── tokenizer.apply_chat_template()로 모델별 변환
+
+2. Tool Call 구조화
+   └── tool_call_id로 요청-응답 매칭
+   └── function name, arguments 명확히 분리
+   └── JSON Schema로 파라미터 검증 가능
+
+3. 범용성
+   └── OpenAI, Anthropic, 오픈소스 모델 모두 호환
+   └── 저장/로딩/디버깅 용이
+```
+
+#### World Model 포맷: Flattened Text (Meta 관점)
+
+```python
+# World Model이 보는 포맷 = 제3자 관점에서 전체 히스토리 관찰
+def create_world_model_prompt(conversation_history: list, current_action: dict, task: str) -> str:
+    """
+    World Model은 대화를 'Meta 관점'에서 텍스트로 봄
+    - 전체 흐름을 한눈에 파악
+    - action의 적절성 판단
+    - next state 예측
+    """
+
+    # 히스토리를 flattened text로 변환
+    history_text = format_history_as_text(conversation_history)
+    action_text = format_action_as_text(current_action)
+
+    return f"""[Task]
+{task}
+
+[Conversation History]
+{history_text}
+
+[Current Action]
+{action_text}
+
+[Instructions]
+위 대화 히스토리와 현재 action을 보고 판단하시오:
+
+1. Next State: 이 action 실행 후 어떤 결과가 나올까?
+2. Reward: 이 action이 task 목표에 기여하는가? (0 or 1)
+   - 잘못된 도구 사용 → 0
+   - 파라미터 오류 → 0
+   - 목표와 무관한 행동 → 0
+   - 목표 달성에 기여 → 1
+3. Terminated: task가 완료되었는가?
+
+[Output Format]
+{{
+    "next_state": "...",
+    "reward": 0 or 1,
+    "reasoning": "...",
+    "terminated": true or false
+}}
+"""
+
+
+def format_history_as_text(messages: list) -> str:
+    """OpenAI messages → Flattened text 변환"""
+    lines = []
+    for msg in messages:
+        role = msg["role"]
+
+        if role == "system":
+            lines.append(f"system: {msg['content']}")
+
+        elif role == "user":
+            lines.append(f"user: {msg['content']}")
+
+        elif role == "assistant":
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    func = tc["function"]
+                    lines.append(f"assistant→tool: {func['name']}({func['arguments']})")
+            elif msg.get("content"):
+                lines.append(f"assistant: {msg['content']}")
+
+        elif role == "tool":
+            content = msg["content"][:200] + "..." if len(msg["content"]) > 200 else msg["content"]
+            lines.append(f"tool→assistant: {content}")
+
+    return "\n".join(lines)
+
+
+def format_action_as_text(action: dict) -> str:
+    """현재 action을 텍스트로 포맷"""
+    if action.get("tool_calls"):
+        tc = action["tool_calls"][0]
+        func = tc["function"]
+        return f"assistant→tool: {func['name']}({func['arguments']})"
+    else:
+        return f"assistant: {action.get('content', '')}"
+```
+
+**World Model 텍스트 예시**:
+```
+[Task]
+Fix the authentication bug in auth.py
+
+[Conversation History]
+system: You are a coding agent. Use tools to complete tasks.
+user: Fix the authentication bug in auth.py
+assistant→tool: Read({"file_path": "auth.py"})
+tool→assistant: def login(user, pwd):
+    return user == 'admin'  # BUG: no password check
+
+[Current Action]
+assistant→tool: Edit({"file_path": "auth.py", "old_string": "return user == 'admin'", ...})
+
+[Judge]
+이 action이 task 목표에 기여하는가?
+```
+
+**Flattened Text 포맷 장점**:
+```
+1. Meta 관점
+   └── 제3자로서 전체 대화 흐름 파악
+   └── "이 agent가 잘 하고 있나?" 판단 가능
+
+2. 단순성
+   └── 복잡한 구조 없이 순차적 텍스트
+   └── LLM이 자연스럽게 이해
+
+3. 유연성
+   └── 필요한 정보만 선택적 포함
+   └── 긴 tool output 요약 가능
+```
+
+#### 데이터 흐름 요약
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Data Flow                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   [Episode Collection]                                                      │
+│         │                                                                   │
+│         ▼                                                                   │
+│   ┌─────────────┐     OpenAI Messages      ┌─────────────┐                 │
+│   │   Actor     │ ◄──────────────────────► │ Environment │                 │
+│   │  (Policy)   │     (tool_calls 포함)     │   (Gym)     │                 │
+│   └─────────────┘                          └──────┬──────┘                 │
+│                                                   │                         │
+│                                          Flatten to Text                    │
+│                                                   │                         │
+│                                                   ▼                         │
+│                                           ┌─────────────┐                   │
+│                                           │ World Model │                   │
+│                                           │  (Judge)    │                   │
+│                                           └──────┬──────┘                   │
+│                                                  │                          │
+│                                            reward (0/1)                     │
+│                                                  │                          │
+│                                                  ▼                          │
+│   ┌─────────────────────────────────────────────────────────────────┐      │
+│   │  Training Data                                                   │      │
+│   │  {                                                               │      │
+│   │    "messages": [...],      ← OpenAI format (Actor 학습용)        │      │
+│   │    "tools": [...],                                               │      │
+│   │    "trajectory_reward": 1,  ← World Model 판단 결과              │      │
+│   │    "step_rewards": [1,1,1]                                       │      │
+│   │  }                                                               │      │
+│   └─────────────────────────────────────────────────────────────────┘      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ### 3.5 Training: Offline GRPO
 
 **선택 이유**:
