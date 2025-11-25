@@ -802,23 +802,480 @@ Phase 2 (Online):
 
 ---
 
+### 3.7 Gymnasium 환경 구현
+
+> **Reference**: [tau2-bench](https://github.com/sierra-research/tau2-bench/tree/main/src/tau2/gym)
+
+**왜 Gymnasium 인터페이스인가**:
+```
+Online GRPO + Gymnasium = Perfect Match
+
+1. reset() → 매 에피소드 fresh state (on-policy 보장)
+2. step()  → action 즉시 실행, reward 즉시 반환
+3. 표준 인터페이스 → 다양한 RL 라이브러리와 호환
+4. No replay buffer → 현재 policy 데이터만 사용
+```
+
+#### 3.7.1 환경 클래스 구현
+
+```python
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Any
+from threading import Thread, Event
+from queue import Queue
+
+class TextSpace(gym.Space):
+    """
+    문자열 기반 observation/action space
+    tau2-bench의 TauSpace 참조
+    """
+    def __init__(self):
+        super().__init__(shape=None, dtype=str)
+
+    def contains(self, x: Any) -> bool:
+        return isinstance(x, str)
+
+    def sample(self):
+        raise NotImplementedError("TextSpace does not support sampling")
+
+
+class AgentEnv(gym.Env):
+    """
+    Agent RL 학습을 위한 Gymnasium 환경
+
+    Reference: tau2-bench AgentGymEnv
+    - World Model (Frontier LRM)이 환경 역할
+    - Actor가 action 생성, World Model이 next state + reward 반환
+    """
+
+    def __init__(
+        self,
+        world_model: "FrozenWorldModel",
+        task: "Task",
+        domain_context: str,
+        max_steps: int = 20
+    ):
+        super().__init__()
+
+        self.world_model = world_model
+        self.task = task
+        self.domain_context = domain_context
+        self.max_steps = max_steps
+
+        # Gymnasium spaces (문자열 기반)
+        self.observation_space = TextSpace()
+        self.action_space = TextSpace()
+
+        # 상태 관리
+        self._state: str = None
+        self._step_count: int = 0
+        self._trajectory: list = []
+        self._done: bool = False
+
+    def reset(self, seed=None, options=None) -> tuple[str, dict]:
+        """
+        새 에피소드 시작
+
+        Returns:
+            observation: 초기 상태 (task description + available tools)
+            info: 추가 정보
+        """
+        super().reset(seed=seed)
+
+        self._state = self.task.initial_state
+        self._step_count = 0
+        self._trajectory = []
+        self._done = False
+
+        # 초기 observation 구성
+        observation = self._format_observation(self._state)
+
+        info = {
+            "task": self.task.description,
+            "available_tools": [t.name for t in self.task.available_tools],
+            "step": 0
+        }
+
+        return observation, info
+
+    def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
+        """
+        Action 실행 후 결과 반환
+
+        Args:
+            action: Agent의 action (JSON 또는 함수형 문자열)
+                    예: '{"name": "Read", "arguments": {"file_path": "main.py"}}'
+                    예: "Read(file_path='main.py')"
+
+        Returns:
+            observation: 다음 상태
+            reward: step reward (0 or 1)
+            terminated: 태스크 완료 여부
+            truncated: max_steps 초과 여부
+            info: 추가 정보
+        """
+        if self._done:
+            raise RuntimeError("Episode already done. Call reset() first.")
+
+        self._step_count += 1
+
+        # Action 파싱
+        parsed_action = self._parse_action(action)
+
+        # World Model로 next state + reward 예측
+        result = self.world_model.simulate(
+            state=self._state,
+            action=parsed_action,
+            task=self.task,
+            domain_context=self.domain_context
+        )
+
+        next_state = result["next_state"]
+        step_reward = result["reward"]  # 0 or 1
+        reasoning = result["reasoning"]
+
+        # Trajectory 기록
+        self._trajectory.append({
+            "state": self._state,
+            "action": parsed_action,
+            "next_state": next_state,
+            "reward": step_reward,
+            "reasoning": reasoning
+        })
+
+        self._state = next_state
+
+        # 종료 조건 체크
+        terminated = self._check_terminated(result)
+        truncated = self._step_count >= self.max_steps
+
+        self._done = terminated or truncated
+
+        # Observation 포맷팅
+        observation = self._format_observation(next_state)
+
+        info = {
+            "step": self._step_count,
+            "step_reward": step_reward,
+            "reasoning": reasoning,
+            "trajectory": self._trajectory if self._done else None
+        }
+
+        return observation, step_reward, terminated, truncated, info
+
+    def _format_observation(self, state: str) -> str:
+        """상태를 observation 문자열로 변환"""
+        return f"""[Task]
+{self.task.description}
+
+[Available Tools]
+{self._format_tools()}
+
+[Current State]
+{state}
+"""
+
+    def _format_tools(self) -> str:
+        """Tool 목록을 문자열로 포맷"""
+        tool_strs = []
+        for tool in self.task.available_tools:
+            params = ", ".join(f"{k}: {v}" for k, v in tool.parameters.items())
+            tool_strs.append(f"- {tool.name}({params}): {tool.description}")
+        return "\n".join(tool_strs)
+
+    def _parse_action(self, action: str) -> dict:
+        """
+        Action 문자열 파싱
+
+        지원 형식:
+        1. JSON: '{"name": "Read", "arguments": {"file_path": "main.py"}}'
+        2. 함수형: "Read(file_path='main.py')"
+        3. 평문: "I'll read the file first" (사용자 대화용)
+        """
+        import json
+        import re
+
+        # JSON 형식 시도
+        try:
+            return json.loads(action)
+        except json.JSONDecodeError:
+            pass
+
+        # 함수형 파싱
+        match = re.match(r"(\w+)\((.*)\)", action)
+        if match:
+            name = match.group(1)
+            args_str = match.group(2)
+            # 간단한 파싱 (실제로는 더 robust하게)
+            arguments = {}
+            if args_str:
+                for arg in args_str.split(","):
+                    key, value = arg.split("=")
+                    arguments[key.strip()] = value.strip().strip("'\"")
+            return {"name": name, "arguments": arguments}
+
+        # 평문 (tool call 아님)
+        return {"name": "message", "content": action}
+
+    def _check_terminated(self, result: dict) -> bool:
+        """태스크 완료 여부 체크"""
+        # World Model이 판단하거나, 특정 action (예: "done") 체크
+        return result.get("terminated", False)
+
+    def get_trajectory(self) -> list:
+        """현재까지의 trajectory 반환"""
+        return self._trajectory
+
+    def get_trajectory_reward(self) -> float:
+        """Trajectory reward (AND 연산)"""
+        if not self._trajectory:
+            return 0.0
+        return 1.0 if all(step["reward"] == 1 for step in self._trajectory) else 0.0
+```
+
+#### 3.7.2 World Model 래퍼
+
+```python
+class FrozenWorldModel:
+    """
+    Frontier LRM을 World Model로 래핑
+
+    - next state 예측
+    - step reward 판단 (0/1)
+    - 학습 없이 API 호출만
+    """
+
+    def __init__(self, api_client, domain_context: str):
+        self.api = api_client
+        self.domain_context = domain_context
+
+    def simulate(
+        self,
+        state: str,
+        action: dict,
+        task: "Task",
+        domain_context: str
+    ) -> dict:
+        """
+        Action 실행 시뮬레이션
+
+        Returns:
+            {
+                "next_state": str,
+                "reward": int (0 or 1),
+                "reasoning": str,
+                "terminated": bool
+            }
+        """
+        prompt = f"""[Domain Context]
+{domain_context}
+
+[Task]
+{task.description}
+
+[Available Tools]
+{self._format_tools(task.available_tools)}
+
+[Current State]
+{state}
+
+[Action Taken]
+{json.dumps(action, ensure_ascii=False)}
+
+[Instructions]
+1. 위 행동의 결과로 나타날 다음 상태를 예측하시오.
+2. 이 행동이 올바른지 판단하시오:
+   - 사용 가능한 도구 외의 도구 사용 → 0
+   - 도구 파라미터 오류 → 0
+   - 목표와 무관한 행동 → 0
+   - 목표 달성에 기여하는 올바른 행동 → 1
+3. 태스크가 완료되었는지 판단하시오.
+
+[Output Format (JSON)]
+{{
+    "next_state": "다음 상태 설명...",
+    "reward": 0 or 1,
+    "reasoning": "판단 근거...",
+    "terminated": true or false
+}}
+"""
+
+        response = self.api.generate(prompt)
+        return self._parse_response(response)
+
+    def _format_tools(self, tools: list) -> str:
+        return "\n".join(
+            f"- {t.name}: {t.description}" for t in tools
+        )
+
+    def _parse_response(self, response: str) -> dict:
+        """LLM 응답 파싱"""
+        import json
+        # JSON 추출 (```json ... ``` 또는 순수 JSON)
+        # 실제 구현에서는 더 robust하게
+        return json.loads(response)
+```
+
+#### 3.7.3 환경 등록 및 생성
+
+```python
+from gymnasium.envs.registration import register
+
+# 환경 등록 (1회)
+def register_agent_env():
+    register(
+        id="AgentRL-v0",
+        entry_point="agent_env:AgentEnv",
+    )
+
+# 환경 생성
+def make_env(task: Task, world_model: FrozenWorldModel, domain_context: str):
+    return AgentEnv(
+        world_model=world_model,
+        task=task,
+        domain_context=domain_context,
+        max_steps=task.max_steps
+    )
+```
+
+#### 3.7.4 Gymnasium + Online GRPO 통합
+
+```python
+def online_grpo_with_gym(
+    actor: "Policy",
+    world_model: FrozenWorldModel,
+    task_pool: TaskPool,
+    domain_context: str,
+    num_iterations: int,
+    rollouts_per_task: int = 5
+):
+    """
+    Gymnasium 인터페이스를 활용한 Online GRPO
+
+    - env.reset() → 매 에피소드 fresh state
+    - env.step() → 즉각적인 state transition + reward
+    - 현재 policy로 생성한 데이터만 사용 (on-policy)
+    """
+
+    for iteration in range(num_iterations):
+        # Task Pool 관리
+        manage_task_pool(task_pool, iteration)
+
+        # Task 샘플링
+        selected_tasks = task_pool.sample_tasks(n=10, strategy="entropy")
+
+        # On-policy 데이터 수집
+        all_trajectories = []
+
+        for task in selected_tasks:
+            task_id = hash_task(task)
+
+            # Gymnasium 환경 생성
+            env = AgentEnv(
+                world_model=world_model,
+                task=task,
+                domain_context=domain_context,
+                max_steps=task.max_steps
+            )
+
+            for _ in range(rollouts_per_task):
+                # 에피소드 시작
+                obs, info = env.reset()
+                trajectory = []
+                done = False
+
+                while not done:
+                    # Actor가 action 생성
+                    action = actor.generate_action(
+                        observation=obs,
+                        available_tools=task.available_tools
+                    )
+
+                    # 환경에서 실행
+                    next_obs, reward, terminated, truncated, step_info = env.step(action)
+
+                    trajectory.append({
+                        "observation": obs,
+                        "action": action,
+                        "reward": reward,
+                        "next_observation": next_obs
+                    })
+
+                    obs = next_obs
+                    done = terminated or truncated
+
+                # Trajectory 저장
+                trajectory_reward = env.get_trajectory_reward()
+                all_trajectories.append({
+                    "task": task,
+                    "task_id": task_id,
+                    "trajectory": trajectory,
+                    "trajectory_reward": trajectory_reward,
+                    "steps": len(trajectory)
+                })
+
+                # Task Pool 통계 업데이트
+                task_pool.update_stats(task_id, trajectory_reward)
+
+        # GRPO 업데이트 (on-policy)
+        actor = grpo_update(actor, all_trajectories)
+
+        # 로깅
+        log_iteration_stats(iteration, all_trajectories, task_pool)
+
+    return actor
+```
+
+**tau2-bench와의 비교**:
+```
+┌────────────────────┬─────────────────────┬─────────────────────┐
+│ 구성요소           │ tau2-bench          │ Our Implementation  │
+├────────────────────┼─────────────────────┼─────────────────────┤
+│ Environment        │ AgentGymEnv         │ AgentEnv            │
+│ Observation Space  │ TauSpace (문자열)   │ TextSpace (문자열)  │
+│ Action Space       │ TauSpace (문자열)   │ TextSpace (문자열)  │
+│ World Model        │ 실제 시뮬레이터     │ Frontier LRM (API)  │
+│ Reward             │ Task 성공 여부      │ Step-level 0/1      │
+│ Threading          │ Orchestrator 스레드 │ 단일 스레드 (동기)  │
+│ User Simulator     │ 지원 (solo_mode)    │ 미지원 (Agent only) │
+└────────────────────┴─────────────────────┴─────────────────────┘
+```
+
+---
+
 ## 4. 전체 학습 파이프라인
+
+> Gymnasium 인터페이스 기반 구현 (Reference: tau2-bench)
 
 ```python
 class PostTrainingRL:
-    def __init__(self,
-                 actor_model_path,
-                 world_model_api,
-                 domain_context,
-                 tool_library):
+    """
+    Agent Post-training RL Framework
+
+    - Gymnasium 환경 인터페이스 (env.reset(), env.step())
+    - Task Pool 기반 curriculum learning
+    - Online GRPO (on-policy)
+    """
+
+    def __init__(
+        self,
+        actor_model_path: str,
+        world_model_api,
+        domain_context: str,
+        tool_library: list[Tool]
+    ):
         # Actor: 학습 대상 (오픈소스 Agentic LRM)
         self.actor = load_model(actor_model_path)
 
         # World Model: Frozen Frontier LRM
         self.world_model = FrozenWorldModel(
-            api=world_model_api,
+            api_client=world_model_api,
             domain_context=domain_context
         )
+
+        # Domain Context
+        self.domain_context = domain_context
 
         # Task Generator & Pool
         self.task_generator = TaskGenerator(domain_context, tool_library)
@@ -828,93 +1285,195 @@ class PostTrainingRL:
         initial_tasks = self.task_generator.generate_candidates(n=100)
         self.task_pool.add_tasks(initial_tasks)
 
-    def train(self, num_iterations, tasks_per_iter, rollouts_per_task):
+    def train(
+        self,
+        num_iterations: int,
+        tasks_per_iter: int = 10,
+        rollouts_per_task: int = 5
+    ):
+        """
+        Online GRPO 학습 루프 (Gymnasium 인터페이스)
+        """
         for iteration in range(num_iterations):
             # ===== Phase 0: Task Pool 관리 =====
             manage_task_pool(self.task_pool, self.task_generator, iteration)
 
             # ===== Phase 1: Task Selection =====
-            # Task Pool에서 entropy 기반 샘플링
             selected_tasks = self.task_pool.sample_tasks(
                 n=tasks_per_iter,
                 strategy="entropy"
             )
 
-            # ===== Phase 2: Data Generation =====
-            dataset = []
+            # ===== Phase 2: Data Generation (Gymnasium) =====
+            all_trajectories = []
+
             for task in selected_tasks:
                 task_id = hash_task(task)
+
+                # Gymnasium 환경 생성
+                env = AgentEnv(
+                    world_model=self.world_model,
+                    task=task,
+                    domain_context=self.domain_context,
+                    max_steps=task.max_steps
+                )
+
                 for _ in range(rollouts_per_task):
-                    # Actor로 rollout
-                    trajectory = self.rollout(task)
-
-                    # Reward 계산
-                    rewards = self.compute_rewards(trajectory, task)
-
-                    dataset.append({
-                        'task': task,
-                        'task_id': task_id,
-                        'trajectory': trajectory,
-                        **rewards
-                    })
+                    trajectory_data = self._collect_episode(env, task)
+                    trajectory_data["task_id"] = task_id
+                    all_trajectories.append(trajectory_data)
 
                     # Task Pool 통계 업데이트
-                    self.task_pool.update_stats(task_id, rewards['trajectory_reward'])
+                    self.task_pool.update_stats(
+                        task_id,
+                        trajectory_data["trajectory_reward"]
+                    )
 
-            # ===== Phase 3: Policy Training =====
-            self.actor = self.grpo_update(dataset)
+            # ===== Phase 3: Policy Training (On-policy GRPO) =====
+            self.actor = self.grpo_update(all_trajectories)
 
             # ===== Logging =====
-            self.log_metrics(iteration, dataset)
-            self.log_curriculum_stats(self.task_pool.get_curriculum_stats())
+            self._log_iteration(iteration, all_trajectories)
 
-    def rollout(self, task):
-        """Actor와 World Model로 trajectory 생성"""
+    def _collect_episode(self, env: AgentEnv, task: Task) -> dict:
+        """
+        Gymnasium 환경에서 에피소드 수집
+
+        Returns:
+            {
+                "task": Task,
+                "trajectory": list of (obs, action, reward, next_obs),
+                "trajectory_reward": float (0 or 1),
+                "steps": int
+            }
+        """
+        obs, info = env.reset()
         trajectory = []
-        state = task.initial_state
+        done = False
 
-        for step in range(task.max_steps):
-            # Actor가 행동 선택 (task의 available_tools 기반)
+        while not done:
+            # Actor가 action 생성
             action = self.actor.generate_action(
-                state=state,
-                task_description=task.description,
-                available_tools=task.available_tools  # Tool set 주입
+                observation=obs,
+                available_tools=task.available_tools
             )
 
-            # World Model이 다음 상태 예측 (동일한 tool set 공유)
-            next_state = self.world_model.predict_next_state(
-                state=state,
-                action=action,
-                task=task  # task.available_tools 포함
-            )
+            # 환경에서 실행
+            next_obs, reward, terminated, truncated, step_info = env.step(action)
 
             trajectory.append({
-                'state': state,
-                'action': action,
-                'next_state': next_state
+                "observation": obs,
+                "action": action,
+                "reward": reward,
+                "next_observation": next_obs,
+                "reasoning": step_info.get("reasoning", "")
             })
 
-            state = next_state
+            obs = next_obs
+            done = terminated or truncated
 
-            if self.is_terminal(state, task):
-                break
+        return {
+            "task": task,
+            "trajectory": trajectory,
+            "trajectory_reward": env.get_trajectory_reward(),
+            "steps": len(trajectory)
+        }
 
-        return trajectory
+    def grpo_update(self, trajectories: list) -> "Policy":
+        """
+        GRPO 정책 업데이트
 
-    def select_tasks_by_entropy(self, candidates, k_rollouts, top_n):
-        """Reward entropy 기반 태스크 선택"""
-        # (구현 상세는 3.3.2 참조)
-        ...
+        - 같은 task의 trajectory들을 그룹으로 묶음
+        - 그룹 내 상대적 advantage 계산
+        - On-policy gradient 업데이트
+        """
+        # Task별 그룹화
+        task_groups = defaultdict(list)
+        for traj in trajectories:
+            task_groups[traj["task_id"]].append(traj)
 
-    def compute_rewards(self, trajectory, task):
-        """Step-level 및 trajectory-level reward 계산"""
-        # (구현 상세는 3.4 참조)
-        ...
+        # 각 그룹에서 GRPO 업데이트
+        for task_id, group in task_groups.items():
+            rewards = [t["trajectory_reward"] for t in group]
+            baseline = np.mean(rewards)
+            advantages = [r - baseline for r in rewards]
 
-    def grpo_update(self, dataset):
-        """Offline GRPO 정책 업데이트"""
-        # (구현 상세는 3.5 참조)
-        ...
+            for traj, adv in zip(group, advantages):
+                if adv > 0:
+                    # 좋은 trajectory 강화
+                    self._reinforce_trajectory(traj, weight=adv)
+                elif adv < 0:
+                    # 나쁜 trajectory 약화
+                    self._penalize_trajectory(traj, weight=-adv)
+
+        return self.actor
+
+    def _reinforce_trajectory(self, traj: dict, weight: float):
+        """좋은 trajectory의 action likelihood 증가"""
+        for step in traj["trajectory"]:
+            self.actor.increase_likelihood(
+                observation=step["observation"],
+                action=step["action"],
+                weight=weight
+            )
+
+    def _penalize_trajectory(self, traj: dict, weight: float):
+        """나쁜 trajectory의 action likelihood 감소"""
+        for step in traj["trajectory"]:
+            self.actor.decrease_likelihood(
+                observation=step["observation"],
+                action=step["action"],
+                weight=weight
+            )
+
+    def _log_iteration(self, iteration: int, trajectories: list):
+        """Iteration 통계 로깅"""
+        rewards = [t["trajectory_reward"] for t in trajectories]
+        steps = [t["steps"] for t in trajectories]
+        curriculum = self.task_pool.get_curriculum_stats()
+
+        print(f"""
+Iteration {iteration}:
+  Trajectories: {len(trajectories)}
+  Avg Reward: {np.mean(rewards):.3f}
+  Avg Steps: {np.mean(steps):.1f}
+  Task Pool: {curriculum['active']} active / {curriculum['mastered']} mastered / {curriculum['too_hard']} too_hard
+  Avg Entropy: {curriculum['avg_entropy']:.3f}
+""")
+
+
+# ===== 사용 예시 =====
+
+def main():
+    # Tool Library 정의
+    tool_library = [
+        Tool(name="Read", description="파일 읽기", parameters={"file_path": "str"}),
+        Tool(name="Edit", description="파일 수정", parameters={"file_path": "str", "old_string": "str", "new_string": "str"}),
+        Tool(name="Bash", description="명령어 실행", parameters={"command": "str"}),
+        Tool(name="Grep", description="패턴 검색", parameters={"pattern": "str", "path": "str"}),
+    ]
+
+    # Domain Context
+    domain_context = """
+    이 환경은 소프트웨어 개발 프로젝트입니다.
+    Agent는 코드를 읽고, 수정하고, 테스트를 실행할 수 있습니다.
+    목표는 버그를 수정하거나 새로운 기능을 구현하는 것입니다.
+    """
+
+    # Trainer 초기화
+    trainer = PostTrainingRL(
+        actor_model_path="path/to/agentic-llm",
+        world_model_api=AnthropicAPI(model="claude-sonnet-4-20250514"),
+        domain_context=domain_context,
+        tool_library=tool_library
+    )
+
+    # 학습 실행
+    trainer.train(
+        num_iterations=1000,
+        tasks_per_iter=10,
+        rollouts_per_task=5
+    )
 ```
 
 ---
